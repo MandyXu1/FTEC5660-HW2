@@ -69,46 +69,114 @@ async def load_mcp_tools() -> list[Any]:
 
 
 def build_agent(tools: list[Any]) -> Any:
-    """Create and return your agent once.
+    """Create and return your agent once."""
+    from langchain_deepseek import ChatDeepSeek
+    from langchain.agents import create_agent
 
-    ``tools`` are the six SocialGraph MCP tools (Facebook + LinkedIn search and
-    profile lookup), already wrapped as LangChain tools. You may add your own
-    local tools as well.
+    llm = ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0.0,
+        max_retries=3,
+    )
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
+    system_prompt = """You are an expert KYC and CV verification agent.
+Your task is to verify a candidate's CV against their LinkedIn (primary source) and Facebook profiles using the provided tools.
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env.
-    """
-    ### YOUR CODE HERE
-    _ = tools
-    return None
+Follow these rules STRICTLY:
+
+1. ENTITY RESOLUTION (FINDING THE RIGHT PERSON):
+   - Hundreds of people share the same name! Always call `search_linkedin_people` with BOTH `q=<name>` AND `location=<city from CV>`.
+   - Check the `headline`, `location`, `industry`, and `years_experience` in the search results to identify the most likely candidate IDs.
+   - Call `get_linkedin_profile` on multiple promising candidate IDs IN PARALLEL (in a single turn) rather than one by one.
+   - CRITICAL: A fraudulent CV (Label 0) still matches the real person on MOST fields and only fabricates 1 or 2 details (e.g., a 1-year date shift, an upgraded degree, or an extra skill). If a profile you inspect has COMPLETELY different schools, companies, and skills from the CV, that is a DIFFERENT person with the same name! Keep looking (or use `search_facebook_users` / `get_facebook_profile` with location) until you find the actual person.
+
+2. FIELD COMPARISON RULES:
+   - ONLY check these fields: name, city, jobs (company, title, seniority, start_year, end_year), education (degree, school, field, graduation year / end_year), and skills.
+   - COMPLETELY IGNORE: job descriptions, headline, summary, and hometown. They are NEVER the source of a discrepancy.
+
+3. WHAT COUNTS AS VALID (Label 1 -> score = 0.95):
+   - Wording or abbreviation differences: e.g., "Bachelor of Science" vs "BSc", "Master of Science" vs "MSc", "Bachelor of Arts" vs "BA", "Bachelor of Engineering" vs "BEng", "Master of Business Administration" vs "MBA", "Doctor of Philosophy" vs "PhD", "UI/UX Design" vs "UI/UX".
+   - Seniority + Title formatting: LinkedIn stores `title` and `seniority` ("junior", "mid", "senior") separately. Combining them on the CV (e.g., "Senior Engineer" when title="Engineer" and seniority="senior", or "Junior Analyst" when title="Analyst" and seniority="junior") or omitting "mid" is VALID.
+   - Current employment dates: On LinkedIn, a current job has `is_current: true` and `end_year: null`. On a CV, this is written as "Present" or "Current". This is VALID.
+   - Education dates: If the CV only states the graduation year and it matches LinkedIn's `end_year`, or states the full `start_year - end_year` range matching LinkedIn, it is VALID.
+   - Skills subset: Listing FEWER skills on the CV than on LinkedIn is VALID, as long as every skill listed on the CV exists on the profile (allowing minor wording variations).
+
+4. WHAT COUNTS AS A DISCREPANCY (Label 0 -> score = 0.05):
+   - Any factual mismatch in the checked fields:
+     * Employment start_year or end_year shifted (even by 1 year!).
+     * Education graduation year (end_year) shifted (even by 1 year!).
+     * Upgraded degree (e.g., claiming MSc when profile says BSc) or wrong field/school.
+     * Inflated job title or seniority (e.g., claiming "Senior" when profile seniority is "junior" or "mid", or claiming "Manager" when profile is "Engineer").
+     * Fake employer/company or wrong city.
+     * Claiming a skill on the CV that the candidate does NOT have on their profile.
+
+5. OUTPUT FORMAT:
+   - Conclude your response with a single JSON object in this exact format:
+{
+  "score": 0.95,
+  "reason": "Brief explanation of your finding and matched person_id."
+}
+"""
+
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
-    """Run your agent and return one reliability score per CV.
+    """Run your agent and return one reliability score per CV."""
+    sem = asyncio.Semaphore(3)
 
-    ``cvs`` maps each file name to its text, e.g. ``{"CV_1.pdf": "...", ...}``.
-    Return a float in [0, 1] for every file name: higher means the CV is more
-    likely consistent with the candidate's LinkedIn/Facebook data. A score
-    above 0.5 counts as "valid", 0.5 or below counts as "has discrepancy".
+    async def verify_single_cv(name: str, text: str) -> tuple[str, float | None]:
+        async with sem:
+            try:
+                response = await agent.ainvoke(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": f"Verify this CV strictly according to your instructions:\n\n{text}",
+                            }
+                        ]
+                    },
+                    config={"recursion_limit": 60},
+                )
 
-        {"CV_1.pdf": 0.9, "CV_4.pdf": 0.1, ...}
+                last_content = response["messages"][-1].content
+                if isinstance(last_content, list):
+                    output_text = " ".join(
+                        block.get("text", "") if isinstance(block, dict) else str(block)
+                        for block in last_content
+                    )
+                else:
+                    output_text = str(last_content)
 
-    Catch errors per CV (e.g. a failed API call) and still return a score for
-    it: an exception here means no results.csv, which scores zero.
+                reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', output_text)
+                reason_str = reason_match.group(1) if reason_match else "No reason parsed"
 
-    MCP tools are async, so call your agent with ``await agent.ainvoke(...)``.
-    You may verify CVs in parallel (e.g. ``asyncio.gather``), but keep at most
-    about 3 CVs in flight (e.g. with ``asyncio.Semaphore(3)``): the MCP server is
-    shared by the whole class.
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+                matches = re.findall(r'"score"\s*:\s*([0-9]*\.?[0-9]+)', output_text)
+                if matches:
+                    score = max(0.0, min(1.0, float(matches[-1])))
+                    print(f"[{name}] Score: {score} | Reason: {reason_str}")
+                    return name, score
 
+                scores = re.findall(r"\b(?:0\.\d+|1\.0|0|1)\b", output_text)
+                if scores:
+                    score = float(scores[-1])
+                    print(f"[{name}] Score (fallback): {score} | Output: {output_text[-120:]}")
+                    return name, score
+
+                print(f"[{name}] Defaulting to 0.5 | Output: {output_text[-120:]}")
+                return name, 0.5
+            except Exception as e:
+                print(f"[Error] Failed to process CV {name}: {e}")
+                return name, 0.5
+
+    tasks = [verify_single_cv(name, text) for name, text in cvs.items()]
+    results = await asyncio.gather(*tasks)
+    return dict(results)
 
 # Everything below is provided runner/scoring code. No edits are needed.
 
